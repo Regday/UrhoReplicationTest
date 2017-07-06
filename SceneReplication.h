@@ -23,6 +23,7 @@
 #pragma once
 
 #include "Sample.h"
+#include "Common.h"
 
 namespace Urho3D
 {
@@ -34,6 +35,14 @@ class Text;
 class UIElement;
 
 }
+
+struct DrawCommand
+{
+	DrawCommand() : position(Vector2::ZERO), color(Color::RED) {}
+	DrawCommand(Vector2 p, Color c) : position(p), color(c) {}
+	Vector2 position;
+	Color	color;
+};
 
 /// Scene network replication example.
 /// This sample demonstrates:
@@ -51,6 +60,8 @@ public:
 
     /// Setup after engine initialization and before running the main loop.
     virtual void Start();
+
+	virtual void Stop();
 
 protected:
     /// Return XML patch instructions for screen joystick layout for a specific sample app, if any.
@@ -77,10 +88,8 @@ private:
     void UpdateButtons();
     /// Create a controllable ball object and return its scene node.
     Node* CreateControllableObject();
-    /// Read input and move the camera.
-    void MoveCamera();
-    /// Handle the physics world pre-step event.
-    void HandlePhysicsPreStep(StringHash eventType, VariantMap& eventData);
+	/// Grab controls under player object
+	void CheckAuthority();
     /// Handle the logic post-update event.
     void HandlePostUpdate(StringHash eventType, VariantMap& eventData);
     /// Handle pressing the connect button.
@@ -97,6 +106,12 @@ private:
     void HandleClientDisconnected(StringHash eventType, VariantMap& eventData);
     /// Handle remote event from server which tells our controlled object node ID.
     void HandleClientObjectID(StringHash eventType, VariantMap& eventData);
+	/// Handle remote event from client which tells where to draw new circle.
+	void HandleDrawCommandRequest(StringHash eventType, VariantMap& eventData);
+	// Handle remote event from server which tells where to draw confirmed command and in which color
+	void HandleDrawCommandConfirmed(StringHash eventType, VariantMap& eventData);
+	// Draw circle
+	void DrawCircle(const Vector2& drawAt, const Color& c);
 
     /// Mapping from client connections to controllable objects.
     HashMap<Connection*, WeakPtr<Node> > serverObjects_;
@@ -112,6 +127,13 @@ private:
     SharedPtr<Button> startServerButton_;
     /// Instructions text.
     SharedPtr<Text> instructionsText_;
+	// Table texture
+	SharedPtr<Texture2D> tableTexture_;
+	// History of draw cmds
+	Vector<DrawCommand> history;
     /// ID of own controllable object (client only.)
     unsigned clientObjectID_;
+	/// ID of own controllable object (client only.)
+	bool	clientObjectAuth_;
+
 };

@@ -37,10 +37,6 @@
 #include <Urho3D/Network/Connection.h>
 #include <Urho3D/Network/Network.h>
 #include <Urho3D/Network/NetworkEvents.h>
-#include <Urho3D/Physics/CollisionShape.h>
-#include <Urho3D/Physics/PhysicsEvents.h>
-#include <Urho3D/Physics/PhysicsWorld.h>
-#include <Urho3D/Physics/RigidBody.h>
 #include <Urho3D/Resource/ResourceCache.h>
 #include <Urho3D/Scene/Scene.h>
 #include <Urho3D/UI/Button.h>
@@ -49,10 +45,18 @@
 #include <Urho3D/UI/Text.h>
 #include <Urho3D/UI/UI.h>
 #include <Urho3D/UI/UIEvents.h>
+#include <Urho3D/Math/MathDefs.h>
+#include <Urho3D/Urho2D/StaticSprite2D.h>
+#include <Urho3D/Graphics/Technique.h>
+#include <Urho3D/Graphics/Texture2D.h>
 
 #include "SceneReplication.h"
 
+#include "CirclePainter.h"
+
 #include <Urho3D/DebugNew.h>
+
+static const int DRAWING_TABLE_SIZE = 512;
 
 // UDP port we will use
 static const unsigned short SERVER_PORT = 2345;
@@ -60,6 +64,11 @@ static const unsigned short SERVER_PORT = 2345;
 static const StringHash E_CLIENTOBJECTID("ClientObjectID");
 // Identifier for the node ID parameter in the event data
 static const StringHash P_ID("ID");
+
+static const StringHash E_DRAWCOMMAND_REQUEST("DrawCommandRequest");
+static const StringHash E_DRAWCOMMAND_CONFIRM("DrawCommandConfirm");
+static const StringHash P_DC_POSITION("DrawCommandPosition");
+static const StringHash P_DC_COLOR("DrawCommandColor");
 
 // Control bits we define
 static const unsigned CTRL_FORWARD = 1;
@@ -70,12 +79,15 @@ static const unsigned CTRL_RIGHT = 8;
 URHO3D_DEFINE_APPLICATION_MAIN(SceneReplication)
 
 SceneReplication::SceneReplication(Context* context) :
-    Sample(context)
+	Sample(context), clientObjectAuth_(false)
 {
+	CirclePainter::RegisterObject(context);
 }
 
 void SceneReplication::Start()
 {
+	context_->RegisterSubsystem(new Console(context_));
+
     // Execute base class startup
     Sample::Start();
 
@@ -92,7 +104,12 @@ void SceneReplication::Start()
     SubscribeToEvents();
 
     // Set the mouse mode to use in the sample
-    Sample::InitMouseMode(MM_RELATIVE);
+    Sample::InitMouseMode(MM_FREE);
+}
+
+void SceneReplication::Stop()
+{
+	GetSubsystem<Log>()->Close();
 }
 
 void SceneReplication::CreateScene()
@@ -105,55 +122,60 @@ void SceneReplication::CreateScene()
     // Create octree and physics world with default settings. Create them as local so that they are not needlessly replicated
     // when a client connects
     scene_->CreateComponent<Octree>(LOCAL);
-    scene_->CreateComponent<PhysicsWorld>(LOCAL);
 
     // All static scene content and the camera are also created as local, so that they are unaffected by scene replication and are
     // not removed from the client upon connection. Create a Zone component first for ambient lighting & fog control.
     Node* zoneNode = scene_->CreateChild("Zone", LOCAL);
     Zone* zone = zoneNode->CreateComponent<Zone>();
     zone->SetBoundingBox(BoundingBox(-1000.0f, 1000.0f));
-    zone->SetAmbientColor(Color(0.1f, 0.1f, 0.1f));
+    zone->SetAmbientColor(Color(1.0f, 1.0f, 1.0f));
     zone->SetFogStart(100.0f);
-    zone->SetFogEnd(300.0f);
-
-    // Create a directional light without shadows
-    Node* lightNode = scene_->CreateChild("DirectionalLight", LOCAL);
-    lightNode->SetDirection(Vector3(0.5f, -1.0f, 0.5f));
-    Light* light = lightNode->CreateComponent<Light>();
-    light->SetLightType(LIGHT_DIRECTIONAL);
-    light->SetColor(Color(0.2f, 0.2f, 0.2f));
-    light->SetSpecularIntensity(1.0f);
+    zone->SetFogEnd(300.0f);	
 
     // Create a "floor" consisting of several tiles. Make the tiles physical but leave small cracks between them
-    for (int y = -20; y <= 20; ++y)
-    {
-        for (int x = -20; x <= 20; ++x)
-        {
-            Node* floorNode = scene_->CreateChild("FloorTile", LOCAL);
-            floorNode->SetPosition(Vector3(x * 20.2f, -0.5f, y * 20.2f));
-            floorNode->SetScale(Vector3(20.0f, 1.0f, 20.0f));
-            StaticModel* floorObject = floorNode->CreateComponent<StaticModel>();
-            floorObject->SetModel(cache->GetResource<Model>("Models/Box.mdl"));
-            floorObject->SetMaterial(cache->GetResource<Material>("Materials/Stone.xml"));
+    Node* tableNode = scene_->CreateChild("Table", LOCAL);
+	tableNode->SetPosition(Vector3(0.0f, 0.0f, 10.0f));
+	tableNode->SetRotation(Quaternion(-90.0f, 0.0f, 0.0f));
+	tableNode->SetScale(Vector3(DRAWING_TABLE_SIZE * PIXEL_SIZE, 1.0f, DRAWING_TABLE_SIZE * PIXEL_SIZE));
+	StaticModel* screenObject = tableNode->CreateComponent<StaticModel>();
+	screenObject->SetModel(cache->GetResource<Model>("Models/Plane.mdl"));
 
-            RigidBody* body = floorNode->CreateComponent<RigidBody>();
-            body->SetFriction(1.0f);
-            CollisionShape* shape = floorNode->CreateComponent<CollisionShape>();
-            shape->SetBox(Vector3::ONE);
-        }
-    }
+	// Create a texture
+	tableTexture_ = SharedPtr<Texture2D>(new Texture2D(context_));
+	tableTexture_->SetSize(DRAWING_TABLE_SIZE, DRAWING_TABLE_SIZE, Graphics::GetRGBFormat(), TEXTURE_DYNAMIC);
+	tableTexture_->SetFilterMode(FILTER_NEAREST);
+	char* c = new char[DRAWING_TABLE_SIZE * DRAWING_TABLE_SIZE * 3];
+	for (int x = 0; x < DRAWING_TABLE_SIZE * 3; x += 3)
+		for (int y = 0; y < DRAWING_TABLE_SIZE * 3; y += 3)
+		{
+			c[x + y * DRAWING_TABLE_SIZE] = 64;
+			c[x + 1 + y * DRAWING_TABLE_SIZE] = 64;
+			c[x + 2 + y * DRAWING_TABLE_SIZE] = 64;
+		}
+	tableTexture_->SetData(0, 0, 0, DRAWING_TABLE_SIZE, DRAWING_TABLE_SIZE, c);
+	delete c;
+	
+	// Create a new material from scratch, use the diffuse unlit technique, assign the render texture
+	// as its diffuse texture, then assign the material to the screen plane object
+	SharedPtr<Material> renderMaterial(new Material(context_));
+	renderMaterial->SetTechnique(0, cache->GetResource<Technique>("Techniques/DiffUnlit.xml"));
+	renderMaterial->SetTexture(TU_DIFFUSE, tableTexture_);
+	screenObject->SetMaterial(renderMaterial);
 
     // Create the camera. Limit far clip distance to match the fog
     // The camera needs to be created into a local node so that each client can retain its own camera, that is unaffected by
     // network messages. Furthermore, because the client removes all replicated scene nodes when connecting to a server scene,
     // the screen would become blank if the camera node was replicated (as only the locally created camera is assigned to a
     // viewport in SetupViewports() below)
+	Graphics* graphics = GetSubsystem<Graphics>();
+
     cameraNode_ = scene_->CreateChild("Camera", LOCAL);
     Camera* camera = cameraNode_->CreateComponent<Camera>();
-    camera->SetFarClip(300.0f);
+	camera->SetOrthographic(true);
+	camera->SetOrthoSize((float)graphics->GetHeight() * PIXEL_SIZE);
 
     // Set an initial position for the camera scene node above the plane
-    cameraNode_->SetPosition(Vector3(0.0f, 5.0f, 0.0f));
+    // cameraNode_->SetPosition(Vector3(0.0f, 0.0f, 0.0f));
 }
 
 void SceneReplication::CreateUI()
@@ -177,7 +199,7 @@ void SceneReplication::CreateUI()
     // Construct the instructions text element
     instructionsText_ = ui->GetRoot()->CreateChild<Text>();
     instructionsText_->SetText(
-        "Use WASD keys to move and RMB to rotate view"
+        "Click to draw a circle"
     );
     instructionsText_->SetFont(cache->GetResource<Font>("Fonts/Anonymous Pro.ttf"), 15);
     // Position the text relative to the screen center
@@ -213,9 +235,6 @@ void SceneReplication::SetupViewport()
 
 void SceneReplication::SubscribeToEvents()
 {
-    // Subscribe to fixed timestep physics updates for setting or applying controls
-    SubscribeToEvent(E_PHYSICSPRESTEP, URHO3D_HANDLER(SceneReplication, HandlePhysicsPreStep));
-
     // Subscribe HandlePostUpdate() method for processing update events. Subscribe to PostUpdate instead
     // of the usual Update so that physics simulation has already proceeded for the frame, and can
     // accurately follow the object with the camera
@@ -234,8 +253,15 @@ void SceneReplication::SubscribeToEvents()
     SubscribeToEvent(E_CLIENTDISCONNECTED, URHO3D_HANDLER(SceneReplication, HandleClientDisconnected));
     // This is a custom event, sent from the server to the client. It tells the node ID of the object the client should control
     SubscribeToEvent(E_CLIENTOBJECTID, URHO3D_HANDLER(SceneReplication, HandleClientObjectID));
+	// This is a custom event, sent from the client to the server. It tells to the server where to draw circle
+	SubscribeToEvent(E_DRAWCOMMAND_REQUEST, URHO3D_HANDLER(SceneReplication, HandleDrawCommandRequest));
+	// This is a custom event, sent from the server to the client. It tells to the client where to draw circle
+	SubscribeToEvent(E_DRAWCOMMAND_CONFIRM, URHO3D_HANDLER(SceneReplication, HandleDrawCommandConfirmed));
+
     // Events sent between client & server (remote events) must be explicitly registered or else they are not allowed to be received
     GetSubsystem<Network>()->RegisterRemoteEvent(E_CLIENTOBJECTID);
+	GetSubsystem<Network>()->RegisterRemoteEvent(E_DRAWCOMMAND_REQUEST);
+	GetSubsystem<Network>()->RegisterRemoteEvent(E_DRAWCOMMAND_CONFIRM);
 }
 
 Button* SceneReplication::CreateButton(const String& text, int width)
@@ -270,148 +296,49 @@ void SceneReplication::UpdateButtons()
 
 Node* SceneReplication::CreateControllableObject()
 {
-    ResourceCache* cache = GetSubsystem<ResourceCache>();
-
     // Create the scene node & visual representation. This will be a replicated object
-    Node* ballNode = scene_->CreateChild("Ball");
-    ballNode->SetPosition(Vector3(Random(40.0f) - 20.0f, 5.0f, Random(40.0f) - 20.0f));
-    ballNode->SetScale(0.5f);
-    StaticModel* ballObject = ballNode->CreateComponent<StaticModel>();
-    ballObject->SetModel(cache->GetResource<Model>("Models/Sphere.mdl"));
-    ballObject->SetMaterial(cache->GetResource<Material>("Materials/StoneSmall.xml"));
+    Node* ballNode = scene_->CreateChild("Painter");
 
-    // Create the physics components
-    RigidBody* body = ballNode->CreateComponent<RigidBody>();
-    body->SetMass(1.0f);
-    body->SetFriction(1.0f);
-    // In addition to friction, use motion damping so that the ball can not accelerate limitlessly
-    body->SetLinearDamping(0.5f);
-    body->SetAngularDamping(0.5f);
-    CollisionShape* shape = ballNode->CreateComponent<CollisionShape>();
-    shape->SetSphere(1.0f);
+	// Create a random colored point light at the ball so that can see better where is going
+	CirclePainter* painter = ballNode->CreateComponent<CirclePainter>();
 
-    // Create a random colored point light at the ball so that can see better where is going
-    Light* light = ballNode->CreateComponent<Light>();
-    light->SetRange(3.0f);
-    light->SetColor(Color(0.5f + (Rand() & 1) * 0.5f, 0.5f + (Rand() & 1) * 0.5f, 0.5f + (Rand() & 1) * 0.5f));
+	ResourceCache* cache = GetSubsystem<ResourceCache>();
+	painter->SetColor(Color(Random(1.0f), Random(1.0f), Random(1.0f)));
 
     return ballNode;
 }
 
-void SceneReplication::MoveCamera()
+void SceneReplication::CheckAuthority()
 {
-    // Right mouse button controls mouse cursor visibility: hide when pressed
-    UI* ui = GetSubsystem<UI>();
-    Input* input = GetSubsystem<Input>();
-    ui->GetCursor()->SetVisible(!input->GetMouseButtonDown(MOUSEB_RIGHT));
+	Network* network = GetSubsystem<Network>();
+	if (clientObjectAuth_ || !clientObjectID_ || network->IsServerRunning())
+		return;
 
-    // Mouse sensitivity as degrees per pixel
-    const float MOUSE_SENSITIVITY = 0.1f;
+	Connection* serverConnection = network->GetServerConnection();
+	if (!serverConnection)
+		return;
 
-    // Use this frame's mouse motion to adjust camera node yaw and pitch. Clamp the pitch and only move the camera
-    // when the cursor is hidden
-    if (!ui->GetCursor()->IsVisible())
-    {
-        IntVector2 mouseMove = input->GetMouseMove();
-        yaw_ += MOUSE_SENSITIVITY * mouseMove.x_;
-        pitch_ += MOUSE_SENSITIVITY * mouseMove.y_;
-        pitch_ = Clamp(pitch_, 1.0f, 90.0f);
-    }
+	Node* node = scene_->GetNode(clientObjectID_);
+	if (!node)
+		return;
 
-    // Construct new orientation for the camera scene node from yaw and pitch. Roll is fixed to zero
-    cameraNode_->SetRotation(Quaternion(pitch_, yaw_, 0.0f));
+	CirclePainter* p = node->GetComponent<CirclePainter>();
+	if (!p)
+		return;
+		
+	p->TakeAuthority();
 
-    // Only move the camera / show instructions if we have a controllable object
-    bool showInstructions = false;
-    if (clientObjectID_)
-    {
-        Node* ballNode = scene_->GetNode(clientObjectID_);
-        if (ballNode)
-        {
-            const float CAMERA_DISTANCE = 5.0f;
-
-            // Move camera some distance away from the ball
-            cameraNode_->SetPosition(ballNode->GetPosition() + cameraNode_->GetRotation() * Vector3::BACK * CAMERA_DISTANCE);
-            showInstructions = true;
-        }
-    }
-
-    instructionsText_->SetVisible(showInstructions);
+	clientObjectAuth_ = true;
+	URHO3D_LOGINFO(Urho3D::ToString("Authority is taken"));
 }
 
 void SceneReplication::HandlePostUpdate(StringHash eventType, VariantMap& eventData)
 {
-    // We only rotate the camera according to mouse movement since last frame, so do not need the time step
-    MoveCamera();
-}
+	Input* input = GetSubsystem<Input>();
+	if (input->GetKeyDown(KEY_F1))
+		GetSubsystem<Console>()->Toggle();
 
-void SceneReplication::HandlePhysicsPreStep(StringHash eventType, VariantMap& eventData)
-{
-    // This function is different on the client and server. The client collects controls (WASD controls + yaw angle)
-    // and sets them to its server connection object, so that they will be sent to the server automatically at a
-    // fixed rate, by default 30 FPS. The server will actually apply the controls (authoritative simulation.)
-    Network* network = GetSubsystem<Network>();
-    Connection* serverConnection = network->GetServerConnection();
-
-    // Client: collect controls
-    if (serverConnection)
-    {
-        UI* ui = GetSubsystem<UI>();
-        Input* input = GetSubsystem<Input>();
-        Controls controls;
-
-        // Copy mouse yaw
-        controls.yaw_ = yaw_;
-
-        // Only apply WASD controls if there is no focused UI element
-        if (!ui->GetFocusElement())
-        {
-            controls.Set(CTRL_FORWARD, input->GetKeyDown(KEY_W));
-            controls.Set(CTRL_BACK, input->GetKeyDown(KEY_S));
-            controls.Set(CTRL_LEFT, input->GetKeyDown(KEY_A));
-            controls.Set(CTRL_RIGHT, input->GetKeyDown(KEY_D));
-        }
-
-        serverConnection->SetControls(controls);
-        // In case the server wants to do position-based interest management using the NetworkPriority components, we should also
-        // tell it our observer (camera) position. In this sample it is not in use, but eg. the NinjaSnowWar game uses it
-        serverConnection->SetPosition(cameraNode_->GetPosition());
-    }
-    // Server: apply controls to client objects
-    else if (network->IsServerRunning())
-    {
-        const Vector<SharedPtr<Connection> >& connections = network->GetClientConnections();
-
-        for (unsigned i = 0; i < connections.Size(); ++i)
-        {
-            Connection* connection = connections[i];
-            // Get the object this connection is controlling
-            Node* ballNode = serverObjects_[connection];
-            if (!ballNode)
-                continue;
-
-            RigidBody* body = ballNode->GetComponent<RigidBody>();
-
-            // Get the last controls sent by the client
-            const Controls& controls = connection->GetControls();
-            // Torque is relative to the forward vector
-            Quaternion rotation(0.0f, controls.yaw_, 0.0f);
-
-            const float MOVE_TORQUE = 3.0f;
-
-            // Movement torque is applied before each simulation step, which happen at 60 FPS. This makes the simulation
-            // independent from rendering framerate. We could also apply forces (which would enable in-air control),
-            // but want to emphasize that it's a ball which should only control its motion by rolling along the ground
-            if (controls.buttons_ & CTRL_FORWARD)
-                body->ApplyTorque(rotation * Vector3::RIGHT * MOVE_TORQUE);
-            if (controls.buttons_ & CTRL_BACK)
-                body->ApplyTorque(rotation * Vector3::LEFT * MOVE_TORQUE);
-            if (controls.buttons_ & CTRL_LEFT)
-                body->ApplyTorque(rotation * Vector3::FORWARD * MOVE_TORQUE);
-            if (controls.buttons_ & CTRL_RIGHT)
-                body->ApplyTorque(rotation * Vector3::BACK * MOVE_TORQUE);
-        }
-    }
+	CheckAuthority();
 }
 
 void SceneReplication::HandleConnect(StringHash eventType, VariantMap& eventData)
@@ -439,6 +366,7 @@ void SceneReplication::HandleDisconnect(StringHash eventType, VariantMap& eventD
         serverConnection->Disconnect();
         scene_->Clear(true, false);
         clientObjectID_ = 0;
+		clientObjectAuth_ = false;
     }
     // Or if we were running a server, stop it
     else if (network->IsServerRunning())
@@ -479,6 +407,14 @@ void SceneReplication::HandleClientConnected(StringHash eventType, VariantMap& e
     VariantMap remoteEventData;
     remoteEventData[P_ID] = newObject->GetID();
     newConnection->SendRemoteEvent(E_CLIENTOBJECTID, true, remoteEventData);
+
+	for (auto it = history.Begin(); it != history.End(); ++it)
+	{
+		VariantMap remoteEventData;
+		remoteEventData[P_DC_POSITION] = it->position;
+		remoteEventData[P_DC_COLOR] = it->color;
+		newConnection->SendRemoteEvent(E_DRAWCOMMAND_CONFIRM, true, remoteEventData);
+	}
 }
 
 void SceneReplication::HandleClientDisconnected(StringHash eventType, VariantMap& eventData)
@@ -497,4 +433,79 @@ void SceneReplication::HandleClientDisconnected(StringHash eventType, VariantMap
 void SceneReplication::HandleClientObjectID(StringHash eventType, VariantMap& eventData)
 {
     clientObjectID_ = eventData[P_ID].GetUInt();
+}
+
+void SceneReplication::DrawCircle(const Vector2& drawAt, const Color& color)
+{
+	const int diameter = 10;
+
+	float readlbounds = (DRAWING_TABLE_SIZE)* PIXEL_SIZE / 2.0f;
+
+	IntVector2 coord = IntVector2((drawAt.x_ + readlbounds) / PIXEL_SIZE, DRAWING_TABLE_SIZE - (drawAt.y_ + readlbounds) / PIXEL_SIZE);
+
+	if (coord.x_ <= 0 || coord.x_ > DRAWING_TABLE_SIZE || coord.y_ <= 0 || coord.y_ > DRAWING_TABLE_SIZE)
+		return;
+
+	char* data = new char[diameter * 3];
+	for (int i = 0; i < diameter * 3; i += 3)
+	{
+		data[i] = color.r_ * 255;
+		data[i + 1] = color.g_ * 255;
+		data[i + 2] = color.b_ * 255;
+	}
+
+	int r = diameter / 2;
+	{
+		int x1;
+		int x2;
+		int counter = (coord.y_ + r);
+		for (int line = (coord.y_ - r); line <= counter; line++)
+		{
+			x1 = int(coord.x_ + sqrt((r*r) - ((line - coord.y_)*(line - coord.y_))) + 0.5);
+			x2 = int(coord.x_ - sqrt((r*r) - ((line - coord.y_)*(line - coord.y_))) + 0.5);
+			x1 = Clamp(x1, 0, DRAWING_TABLE_SIZE);
+			x2 = Clamp(x2, 0, DRAWING_TABLE_SIZE);
+			if (x1 <= x2)
+				continue;
+			URHO3D_LOGDEBUG(Urho3D::ToString("SetData(%d, %d, %d, %d, %d)", 0, x2, line, x1 - x2, 1));
+			tableTexture_->SetData(0, x2, line, x1 - x2, 1, data);
+		}
+	}
+	delete data;
+}
+
+void SceneReplication::HandleDrawCommandRequest(StringHash eventType, VariantMap& eventData)
+{
+	unsigned int	drawBy = eventData[P_ID].GetUInt();
+	Vector2		drawAt = eventData[P_DC_POSITION].GetVector2();
+
+	Node* node = scene_->GetNode(drawBy);
+	if (!node)
+		return;
+
+	CirclePainter* p = node->GetComponent<CirclePainter>();
+	if (!p)
+		return;
+
+	DrawCommand dc = DrawCommand(drawAt, p->GetColor());
+	history.Push(dc);
+	DrawCircle(dc.position, dc.color);
+
+
+	Network* network = GetSubsystem<Network>();
+	if (!network->IsServerRunning())
+		return;
+
+	VariantMap remoteEventData;
+	remoteEventData[P_DC_POSITION] = dc.position;
+	remoteEventData[P_DC_COLOR] = dc.color;
+	network->BroadcastRemoteEvent(E_DRAWCOMMAND_CONFIRM, true, remoteEventData);
+}
+
+void SceneReplication::HandleDrawCommandConfirmed(StringHash eventType, VariantMap& eventData)
+{
+	Vector2		drawAt = eventData[P_DC_POSITION].GetVector2();
+	Color		color = eventData[P_DC_COLOR].GetColor();
+
+	DrawCircle(drawAt, color);
 }
